@@ -1,4 +1,4 @@
-# -*- coding:utf-8 -*-
+# -*- coding: utf-8 -*-
 
 'a simple orm module'
 
@@ -64,15 +64,22 @@ def select(sql,args,size=None):             #参数：？
 
 #执行Inser,Update,Delete的通用函数
 @asyncio.coroutine
-def execute(sql,args):
+def execute(sql,args,autocommit=True):
     log(sql)
     with (yield from __pool) as conn:
+        if not autocommit:
+            yield from conn.begin()
         try:
             cur=yield from conn.cursor()
             yield from cur.execute(sql.replace('?','%s'),args)
             affected=cur.rowcount       #通过rowcount返回语句作用的结果数
+            yield from cur.close()
+            if not autocommit:
+                yield from conn.commit()
         except BaseException as e:
-            raise
+            if not autocommit:
+                yield from conn.rollback()
+            raise e
 
         return affected
 
@@ -109,12 +116,12 @@ class IntegerField(Field):              #INT类型，bigint,默认default为0
     def __init__(self,name=None,primary_key=False,default=0):
         super().__init__(name,'bigint',primary_key,default)
 
-class StringFeild(Field):               #String类型，可传入ddl参数，默认default为None
+class StringField(Field):               #String类型，可传入ddl参数，默认default为None
     
     def __init__(self,name=None,primary_key=False,default=None,ddl='varchar(100)'):
         super().__init__(name,ddl,primary_key,default)
 
-class BooleanFeild(Field):  #Bool类型，boolean,不能作为主键，默认dfault为False
+class BooleanField(Field):  #Bool类型，boolean,不能作为主键，默认dfault为False
     
     def __init__(self,name=None,default=False):
         super().__init__(name,'boolean',False,default)
@@ -124,7 +131,7 @@ class FloatField(Field):                #浮点类型,real，默认default为0.0
     def __init__(self,name=None,primary_key=False,default=0.0):
         super().__init__(name,'real',primary_key,default)
 
-class TextFeild(Field):                 #文本类型,test，不能作为主键,默认default为none
+class TextField(Field):                 #文本类型,test，不能作为主键,默认default为none
 
     def __init__(self,name=None,default=None):
         super().__init__(name,'text',False,default)
@@ -138,15 +145,14 @@ class ModelMetaclass(type):
         if name=='Model':                   #排除基类本身
             return type.__new__(cls,name,bases,attrs)
         tableName=attrs.get('__table__',None) or name   #通过传入的类属性或类名获得数据库表名
-        logging.info('found model:%s (table: %s)'% (name,tableName))
-        
+        logging.error('found model:%s (table:%s)'%(name,tableName))        
         #获取所有的Field和主键名
         mappings=dict()             #保存映射关系的字典
         fields=[]                   #保存Model类除主键外的字段名
         primaryKey=None             #保存Model类的主键字段名
         for k,v in attrs.items():   
             if isinstance(v,Field): #传入的类的属性是Field类型就加入mappings
-                logging.info('found mapping:%s==>%s' % (k,v))
+                logging.error('found mapping:%s==>%s' % (k,v))
                 mappings[k]=v       #k:属性名；v：实例
                 if v.primary_key:   #如果v（Field类实例）的primary_key=True
                     
@@ -154,7 +160,7 @@ class ModelMetaclass(type):
                         raise RuntimeError('Duplicate primary key for field:%s' % k)
                     primaryKey=k
                 else:               #v不是主键时
-                    fields.appends(k)   #非主键字段名存到fields里面
+                    fields.append(k)   #非主键字段名存到fields里面
                 
         if not primaryKey:          #如果遍历完还没有主键，抛出错误
             raise RuntimeError('Primary key not found')
@@ -163,8 +169,8 @@ class ModelMetaclass(type):
             attrs.pop(k)
 
         #'attr'-->'`attr`'
-        #不加`符号在mysql中可能报错，未验证
-        escaped_fields = list(map(lambda f:'`s%`' % f,fields))
+        #不加`符号在mysql中可能报错
+        escaped_fields = list(map(lambda f: '`%s`' % f, fields))
 
         attrs['__mappings__']=mappings      #保存属性和字段之间的映射关系
         attrs['__table__']=tableName
@@ -174,7 +180,8 @@ class ModelMetaclass(type):
         attrs['__insert__']='insert into `%s` (%s,`%s`) values(%s)' % (tableName,','.join(escaped_fields),primaryKey,create_args_string(len(escaped_fields)+1))         #问号太多，使用create_args_string函数来生成num个占位符的string
         attrs['__update__']='update `%s` set %s where `%s`=?' % (tableName,','.join(map(lambda f:'`%s`=?' % (mappings.get(f).name or f),fields)),primaryKey)
         attrs['__delete__']='delete from `%s` where `%s`=?' % (tableName,primaryKey)
-
+        logging.error('finish')
+        return type.__new__(cls,name,bases,attrs)
 #用在元类里面的函数
 def create_args_string(num):
     #insert插入属性时，增加num个数量的占位符
@@ -185,40 +192,50 @@ def create_args_string(num):
 
 #------------------------------------------基类Model--------------------------------------
 class Model(dict,metaclass=ModelMetaclass):
+    
+    #def __call__(self):
+    #    print('test')
     #继承dict
     def __init__(self,**kw):
         super(Model,self).__init__(**kw)
-    
     #实现__getattr__和__setattr__即可普通的用instance.key的形式
     def __getattr__(self,key):     
+        #logging.error('test1')
         try:
             return self[key]        
         except KeyError:
             raise AttributeError(r"'Model' object has no attribute '%s'" % key)
 
     def __setattr__(self,key,value):
+        #logging.error('test2')
         self[key]=value
 
     def getValue(self,key):
+        #logging.error('test3')
         return getattr(self,key,None)
 
     def getValueOrDefault(self,key):
+        #logging.error('test4')
         #当value为None时返回Field类设置的默认值
         value=getattr(self,key,None)        #key不存在就获取None
         if value is None:
             #self.__mappings__保存映射关系
             field=self.__mappings__[key]
             if field.default is not None:   #如果字段存在默认值，则使用默认值
-                value=field.defaul
+                #if callable(field.default):
+                #    value=field.default()
+                #else:
+                #    value=field.defaut
+                value=field.default() if callable(field.default) else field.default
                 logging.debug('using default value for %s: %s' % (key,str(value)))
                 setattr(self,key,value)     #赋予实例默认zhi
         return value
 
 #---------------------------------------Model的类方法--------------------------------
-
     @classmethod    
     @asyncio.coroutine
     def findAll(cls, where=None, args=None, **kw):
+        
         sql = [cls.__select__]  # 获取默认的select语句
         if where:   # 如果有where语句，则修改sql变量
             sql.append('where')  # sql里面加上where关键字
@@ -306,3 +323,4 @@ class Model(dict,metaclass=ModelMetaclass):
         if rows != 1:
             logging.warn(
                 'failed to remove by primary key: affected rows: %s' % rows)
+
